@@ -11,6 +11,7 @@ import networkx as nx
 from pathlib import Path
 import json
 import pickle
+from collections import Counter
 from tqdm import tqdm
 
 
@@ -18,6 +19,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from src.config.mode_config import ModeConfig, TrainingMode
 from src.data.task_definition import TaskManager
+from src.graph.weighting import combine_graph_similarity
 
 
 class ModeAwareTaskGraphBuilder:
@@ -37,11 +39,14 @@ class ModeAwareTaskGraphBuilder:
     def __init__(self,
                  task_manager: TaskManager,
                  mode_config: ModeConfig,
-                 hla_sequences_file: str = 'configs/hla_sequences.json'):
+                 hla_sequences_file: str = 'configs/hla_sequences.json',
+                 allow_random_hla_fallback: bool = False):
 
         self.task_manager = task_manager
         self.mode = mode_config.mode
         self.mode_config = mode_config
+        self.tissue_graph_weight = float(mode_config.tissue_graph_weight)
+        self.hla_graph_weight = float(mode_config.hla_graph_weight)
 
         # 获取所有tasks
         self.tasks = list(task_manager.get_all_tasks().keys())
@@ -52,15 +57,24 @@ class ModeAwareTaskGraphBuilder:
         print(f"Mode-Aware Task Graph Builder - {mode_config.task_type_name}")
         print(f"{'='*80}")
         print(f"  Tasks: {self.n_tasks}")
+        if self.mode == TrainingMode.HLA_TISSUE:
+            print(
+                "  Edge-weight mixture: "
+                f"HLA={self.hla_graph_weight:.2f}, "
+                f"tissue={self.tissue_graph_weight:.2f}"
+            )
 
         # 加载HLA序列
-        self._load_hla_sequences(hla_sequences_file)
+        self._load_hla_sequences(
+            hla_sequences_file,
+            allow_random_fallback=allow_random_hla_fallback,
+        )
 
         # Mode 2需要构建tissue映射
         if self.mode == TrainingMode.HLA_TISSUE:
             self._build_tissue_mappings()
 
-    def _load_hla_sequences(self, sequences_file):
+    def _load_hla_sequences(self, sequences_file, allow_random_fallback=False):
         """加载HLA伪序列"""
         print(f"\n加载HLA序列: {sequences_file}")
 
@@ -68,8 +82,13 @@ class ModeAwareTaskGraphBuilder:
             with open(sequences_file) as f:
                 self.hla_sequences = json.load(f)
             print(f"  ✓ 加载了 {len(self.hla_sequences)} 个HLA序列")
-        except:
-            print(f"  ⚠ 无法加载HLA序列文件,使用随机序列")
+        except (OSError, json.JSONDecodeError) as exc:
+            if not allow_random_fallback:
+                raise RuntimeError(
+                    f"无法读取有效的HLA伪序列文件: {sequences_file}. "
+                    "Graph-weight实验禁止使用随机序列fallback。"
+                ) from exc
+            print(f"  ⚠ 无法加载HLA序列文件,显式启用随机序列调试fallback")
             # 生成随机序列作为fallback
             unique_hlas = set(task.hla for task in self.task_objects.values())
             self.hla_sequences = {}
@@ -77,6 +96,33 @@ class ModeAwareTaskGraphBuilder:
             for hla in unique_hlas:
                 seq = ''.join(np.random.choice(list(amino_acids), 34))
                 self.hla_sequences[hla] = seq
+
+        required_hlas = {task.hla for task in self.task_objects.values()}
+        missing_hlas = sorted(required_hlas - set(self.hla_sequences))
+        if missing_hlas:
+            preview = ', '.join(missing_hlas[:10])
+            raise ValueError(
+                f"HLA伪序列文件缺少 {len(missing_hlas)} 个训练alleles: {preview}"
+            )
+
+        invalid_hlas = [
+            hla for hla in required_hlas
+            if not isinstance(self.hla_sequences[hla], str)
+            or not self.hla_sequences[hla]
+        ]
+        if invalid_hlas:
+            raise ValueError(
+                f"HLA序列文件存在空值或非字符串: {invalid_hlas[:10]}"
+            )
+
+        length_counts = Counter(len(self.hla_sequences[hla]) for hla in required_hlas)
+        self.hla_sequence_length_counts = dict(sorted(length_counts.items()))
+        if len(length_counts) > 1:
+            print(
+                "  ⚠ HLA序列长度不一致；为复现原实验，不等长allele pair的"
+                "HLA similarity将设为0"
+            )
+            print(f"  长度分布: {self.hla_sequence_length_counts}")
 
     def _build_tissue_mappings(self):
         """构建tissue映射 (Mode 2)"""
@@ -92,7 +138,7 @@ class ModeAwareTaskGraphBuilder:
         """
         计算HLA序列相似性
 
-        使用BLOSUM62矩阵
+        保留原实验实现：等长序列使用逐位identity；不等长序列返回0。
         """
         seq1 = self.hla_sequences.get(hla1, '')
         seq2 = self.hla_sequences.get(hla2, '')
@@ -144,8 +190,12 @@ class ModeAwareTaskGraphBuilder:
                         hla_sim = self.compute_hla_similarity(task_i.hla, task_j.hla)
                         tissue_sim = self.compute_tissue_cooccurrence(task_i, task_j)
 
-                        # 加权组合 (70% HLA + 30% tissue)
-                        sim = 0.7 * hla_sim + 0.3 * tissue_sim
+                        # 权重由ModeConfig控制；两项权重之和固定为1。
+                        sim = combine_graph_similarity(
+                            hla_sim,
+                            tissue_sim,
+                            self.tissue_graph_weight,
+                        )
 
                     else:
                         # Mode 3: 待定
@@ -222,7 +272,7 @@ class ModeAwareTaskGraphBuilder:
 
         return G
 
-    def save(self, graph, similarity_matrix, output_dir):
+    def save(self, graph, similarity_matrix, output_dir, threshold=None):
         """
         保存Task Graph和相关数据
 
@@ -250,7 +300,9 @@ class ModeAwareTaskGraphBuilder:
             'tasks': self.tasks,
             'task_to_idx': {task_id: i for i, task_id in enumerate(self.tasks)},
             'idx_to_task': {i: task_id for i, task_id in enumerate(self.tasks)},
-            'n_tasks': self.n_tasks
+            'n_tasks': self.n_tasks,
+            'hla_graph_weight': self.hla_graph_weight,
+            'tissue_graph_weight': self.tissue_graph_weight,
         }
 
         # Mode 2添加tissue映射
@@ -266,6 +318,43 @@ class ModeAwareTaskGraphBuilder:
         with open(output_dir / 'mode_config.json', 'w') as f:
             json.dump(self.mode_config.to_dict(), f, indent=2)
         print(f"  ✓ mode_config.json")
+
+        # 5. 保存本次graph的可比较统计，供weight-sweep自动汇总。
+        n_nodes = graph.number_of_nodes()
+        n_edges = graph.number_of_edges()
+        possible_edges = n_nodes * (n_nodes - 1) / 2
+        edge_weights = [data['weight'] for _, _, data in graph.edges(data=True)]
+        components = (
+            list(nx.connected_components(graph)) if n_nodes > 0 else []
+        )
+        graph_statistics = {
+            'mode': self.mode.value,
+            'n_nodes': n_nodes,
+            'n_edges': n_edges,
+            'density': float(n_edges / possible_edges) if possible_edges else 0.0,
+            'average_degree': float(2 * n_edges / n_nodes) if n_nodes else 0.0,
+            'n_connected_components': len(components),
+            'largest_component_size': (
+                len(max(components, key=len)) if components else 0
+            ),
+            'mean_edge_weight': float(np.mean(edge_weights)) if edge_weights else 0.0,
+            'min_edge_weight': float(np.min(edge_weights)) if edge_weights else 0.0,
+            'max_edge_weight': float(np.max(edge_weights)) if edge_weights else 0.0,
+            'graph_threshold': None if threshold is None else float(threshold),
+            'hla_graph_weight': self.hla_graph_weight,
+            'tissue_graph_weight': self.tissue_graph_weight,
+            'hla_sequence_length_counts': {
+                str(k): v for k, v in self.hla_sequence_length_counts.items()
+            },
+            'hla_similarity_unequal_length_policy': 'zero',
+            'formula': (
+                '(1 - tissue_graph_weight) * sim_HLA + '
+                'tissue_graph_weight * I_same_tissue'
+            ),
+        }
+        with open(output_dir / 'graph_statistics.json', 'w') as f:
+            json.dump(graph_statistics, f, indent=2)
+        print(f"  ✓ graph_statistics.json")
 
     def build_and_save(self, output_dir, threshold=0.3):
         """
@@ -289,7 +378,7 @@ class ModeAwareTaskGraphBuilder:
         graph = self.build_graph(similarity_matrix, threshold)
 
         # 3. 保存
-        self.save(graph, similarity_matrix, output_dir)
+        self.save(graph, similarity_matrix, output_dir, threshold=threshold)
 
         print(f"\n{'='*80}")
         print(f"Task Graph构建完成!")
