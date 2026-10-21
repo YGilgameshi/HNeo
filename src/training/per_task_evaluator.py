@@ -236,6 +236,9 @@ class PerTaskEvaluator:
                 'std_auroc': float(df['auroc'].std()),
                 'min_auroc': float(df['auroc'].min()),
                 'max_auroc': float(df['auroc'].max()),
+                'mean_auprc': float(df['auprc'].mean()),
+                'median_auprc': float(df['auprc'].median()),
+                'std_auprc': float(df['auprc'].std()),
                 'mean_accuracy': float(df['accuracy'].mean()),
                 'mean_f1': float(df['f1'].mean())
             }

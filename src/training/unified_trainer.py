@@ -16,6 +16,8 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import json
+import random
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
@@ -25,6 +27,19 @@ from src.data.task_definition import TaskManager
 from src.data.dataset import ModeAwareDataset, collate_fn_mode_aware
 from src.models.full_model import ImmuneAppModel
 from src.graph.task_graph import ModeAwareTaskGraphBuilder, TaskGraphWrapper
+
+
+def set_reproducible_seed(seed: int):
+    """设置本次训练使用的随机种子，并尽量固定CUDA/cuDNN行为。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def compute_task_weights(task_datasets, smoothing='log'):
@@ -339,12 +354,17 @@ class Evaluator:
         评估模型
 
         Returns:
-            metrics: dict with 'loss', 'auroc', 'auprc', 'ppv'
+            metrics: dict with 'loss', 'auroc', 'auprc', 'ppv', 'mean_task_auroc'
+                - 'auroc': pooled AUROC（所有task的样本拼成一个数组算一次，旧口径，
+                  保留下来仅用于参考/排错，不再用于挑选 best_model.pt）
+                - 'mean_task_auroc': 每个 task 分别算 AUROC 再取平均（D2 修复：论文
+                  实际声称使用的口径，现在用它来挑选 best_model.pt）
         """
         model.eval()
 
         all_logits = []
         all_labels = []
+        all_task_idx = []
         epoch_losses = []
 
         graph_data = {
@@ -361,24 +381,45 @@ class Evaluator:
 
                 all_logits.append(logits.cpu().numpy())
                 all_labels.append(batch['label'].cpu().numpy())
+                all_task_idx.append(batch['task_idx'].cpu().numpy())
                 epoch_losses.append(loss.item())
 
         # 合并结果
         all_logits = np.concatenate(all_logits)
         all_labels = np.concatenate(all_labels)
+        all_task_idx = np.concatenate(all_task_idx)
         all_probs = torch.sigmoid(torch.tensor(all_logits)).numpy()
 
         # 计算metrics
-        from sklearn.metrics import roc_auc_score, average_precision_score
-
         metrics = {
             'loss': np.mean(epoch_losses),
             'auroc': roc_auc_score(all_labels, all_probs),
             'auprc': average_precision_score(all_labels, all_probs),
-            'ppv': self._compute_ppv_at_k(all_labels, all_probs, k=100)
+            'ppv': self._compute_ppv_at_k(all_labels, all_probs, k=100),
+            'mean_task_auroc': self._compute_mean_task_auroc(all_labels, all_probs, all_task_idx),
         }
 
         return metrics
+
+    def _compute_mean_task_auroc(self, labels, probs, task_idx):
+        """
+        D2 修复：按 task 分别算 AUROC 再取平均，而不是把所有 task 的样本
+        拼起来算一次 pooled AUROC。
+
+        某个 task 在这次 eval 里只含单一类别（全正或全负）时 AUROC 无定义，
+        跳过该 task、不计入平均（不当 0 分处理，避免拖累整体均值）。
+        """
+        task_aurocs = []
+        for t in np.unique(task_idx):
+            mask = task_idx == t
+            task_labels = labels[mask]
+            if len(np.unique(task_labels)) < 2:
+                continue
+            task_aurocs.append(roc_auc_score(task_labels, probs[mask]))
+
+        if len(task_aurocs) == 0:
+            return float('nan')
+        return float(np.mean(task_aurocs))
 
     def _compute_ppv_at_k(self, labels, probs, k=100):
         """计算PPV@k"""
@@ -429,10 +470,14 @@ def train_model(
         model, history
     """
 
+    random_seed = int(kwargs.get('random_seed', 42))
+    set_reproducible_seed(random_seed)
+
     print(f"\n{'=' * 80}")
     print(f"Training {mode_config.task_type_name} Model")
     print(f"  Method: {'MAML' if mode_config.use_maml else 'Standard'}")
     print(f"  Device: {device}")
+    print(f"  Random seed: {random_seed}")
     print(f"  Task-Balanced: {use_task_balanced}")
     if use_task_balanced:
         print(f"    Samples per task: {samples_per_task or 'auto'}")
@@ -452,7 +497,8 @@ def train_model(
     graph_builder = ModeAwareTaskGraphBuilder(
         task_manager,
         mode_config,
-        hla_sequences_file=kwargs.get('hla_sequences_file', 'configs/hla_sequences.json')
+        hla_sequences_file=kwargs.get('hla_sequences_file', 'configs/hla_sequences.json'),
+        allow_random_hla_fallback=kwargs.get('allow_random_hla_fallback', False),
     )
 
     graph, similarity_matrix = graph_builder.build_and_save(
@@ -491,7 +537,8 @@ def train_model(
             mode_config=mode_config,
             graph_wrapper=graph_wrapper,
             sampling_strategy=sampling_strategy,
-            negative_ratio=negative_ratio
+            negative_ratio=negative_ratio,
+            random_seed=random_seed,
         )
     else:
         # 使用原始Dataset
@@ -635,11 +682,12 @@ def train_model(
     history = {
         'train_loss': [],
         'val_loss': [],
-        'val_auroc': [],
-        'val_auprc': []
+        'val_auroc': [],            # pooled（旧口径，仍记录，仅供参考/排错）
+        'val_auprc': [],
+        'val_mean_task_auroc': [],  # D2 修复：现在用这个口径挑选 best_model.pt
     }
 
-    best_val_auroc = 0.0
+    best_val_mean_task_auroc = 0.0
 
     for epoch in range(n_epochs):
         print(f"\n{'=' * 80}")
@@ -666,30 +714,36 @@ def train_model(
         history['val_loss'].append(val_metrics['loss'])
         history['val_auroc'].append(val_metrics['auroc'])
         history['val_auprc'].append(val_metrics['auprc'])
+        history['val_mean_task_auroc'].append(val_metrics['mean_task_auroc'])
 
         # 打印
         print(f"\nTrain Loss: {train_metrics['loss']:.4f}")
         if mode_config.use_maml:
             print(f"  Support Loss: {train_metrics.get('support_loss', 0):.4f}")
         print(f"Val Loss: {val_metrics['loss']:.4f}")
-        print(f"Val AUROC: {val_metrics['auroc']:.4f}")
+        print(f"Val AUROC (pooled, 仅参考): {val_metrics['auroc']:.4f}")
+        print(f"Val Mean-Task-AUROC (D2 修复后的选模型口径): {val_metrics['mean_task_auroc']:.4f}")
         print(f"Val AUPRC: {val_metrics['auprc']:.4f}")
         print(f"Val PPV@2%: {val_metrics['ppv']:.4f}")
 
-        # 保存最佳模型
-        if val_metrics['auroc'] > best_val_auroc:
-            best_val_auroc = val_metrics['auroc']
+        # 保存最佳模型（D2 修复：用 mean_task_auroc 而不是 pooled auroc 来挑选）
+        if val_metrics['mean_task_auroc'] > best_val_mean_task_auroc:
+            best_val_mean_task_auroc = val_metrics['mean_task_auroc']
 
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'val_auroc': val_metrics['auroc'],
+                'val_auroc': val_metrics['auroc'],                        # pooled，仅供参考
+                'val_mean_task_auroc': val_metrics['mean_task_auroc'],    # 实际选模型用的口径
                 'val_auprc': val_metrics['auprc'],
                 'mode_config': mode_config.to_dict(),
+                'random_seed': random_seed,
+                'selection_metric': 'mean_task_auroc',
                 'history': history
             }, output_dir / 'best_model.pt')
 
-            print(f"✓ Saved best model (AUROC: {best_val_auroc:.4f})")
+            print(f"✓ Saved best model (Mean-Task-AUROC: {best_val_mean_task_auroc:.4f}, "
+                  f"pooled AUROC此时为: {val_metrics['auroc']:.4f})")
 
     # ========== 6. Final Per-Task Evaluation ==========
     print(f"\n{'=' * 80}")
@@ -745,8 +799,17 @@ def train_model(
         'mode': mode_config.task_type_name,
         'use_maml': mode_config.use_maml,
         'n_epochs': n_epochs,
-        'best_val_auroc': float(best_val_auroc),
-        'final_val_auroc': float(history['val_auroc'][-1]),
+        'random_seed': random_seed,
+        'graph': {
+            'hla_graph_weight': float(mode_config.hla_graph_weight),
+            'tissue_graph_weight': float(mode_config.tissue_graph_weight),
+            'threshold': float(kwargs.get('graph_threshold', 0.3)),
+        },
+        'selection_metric': 'mean_task_auroc',                                     # D2: 记录实际用的选模型口径
+        'best_val_mean_task_auroc': float(best_val_mean_task_auroc),
+        'final_val_mean_task_auroc': float(history['val_mean_task_auroc'][-1]),
+        'best_val_auroc': float(max(history['val_auroc'])),                        # pooled，仅供参考
+        'final_val_auroc': float(history['val_auroc'][-1]),                        # pooled，仅供参考
         'history': convert_to_native(history)
     }
 
@@ -755,7 +818,8 @@ def train_model(
 
     print(f"\n{'=' * 80}")
     print(f"Training completed!")
-    print(f"  Best Val AUROC: {best_val_auroc:.4f}")
+    print(f"  Best Val Mean-Task-AUROC (选模型用的口径): {best_val_mean_task_auroc:.4f}")
+    print(f"  Best Val AUROC (pooled, 仅供参考): {max(history['val_auroc']):.4f}")
     print(f"  Results saved to: {output_dir}")
     print(f"{'=' * 80}")
 
