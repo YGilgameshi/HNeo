@@ -60,6 +60,11 @@ class ModeConfig:
     tissue_source: Optional[str] = 'Host'  # 组织来源列名
     use_tissue_expression: bool = False     # 是否使用表达谱数据
 
+    # Task graph相关 (Mode 2)
+    # w_ij = (1 - tissue_graph_weight) * sim_HLA +
+    #        tissue_graph_weight * I[same tissue]
+    tissue_graph_weight: float = 0.3
+
     # 训练方法相关
     use_maml: bool = True                   # 是否使用MAML (True=MAML, False=Standard)
     inner_lr: float = 0.01                  # MAML内循环学习率
@@ -73,6 +78,12 @@ class ModeConfig:
 
     def __post_init__(self):
         """验证配置合理性"""
+        if not 0.0 <= self.tissue_graph_weight <= 1.0:
+            raise ValueError(
+                "tissue_graph_weight must be between 0 and 1, "
+                f"got {self.tissue_graph_weight}"
+            )
+
         if self.mode == TrainingMode.HLA_ONLY:
             # Mode 1不使用tissue信息
             self.use_tissue_expression = False
@@ -96,6 +107,11 @@ class ModeConfig:
             TrainingMode.HYBRID: 'Hybrid'
         }[self.mode]
 
+    @property
+    def hla_graph_weight(self) -> float:
+        """HLA相似性权重；与tissue权重之和固定为1。"""
+        return 1.0 - self.tissue_graph_weight
+
     def to_dict(self) -> dict:
         """转为字典（存入checkpoint）"""
         return {
@@ -105,6 +121,8 @@ class ModeConfig:
             'negative_ratio': int(self.negative_ratio),
             'tissue_source': self.tissue_source,
             'use_tissue_expression': bool(self.use_tissue_expression),
+            'tissue_graph_weight': float(self.tissue_graph_weight),
+            'hla_graph_weight': float(self.hla_graph_weight),
             'use_maml': bool(self.use_maml),
             'inner_lr': float(self.inner_lr),
             'inner_steps': int(self.inner_steps),
@@ -136,13 +154,14 @@ def create_mode2_config(**kwargs) -> ModeConfig:
         negative_ratio=kwargs.get('negative_ratio', 20),
         tissue_source=kwargs.get('tissue_source', 'Host'),
         exclude_unknown_tissue=kwargs.get('exclude_unknown_tissue', True),
+        tissue_graph_weight=kwargs.get('tissue_graph_weight', 0.3),
         use_maml=kwargs.get('use_maml', True),
         inner_lr=kwargs.get('inner_lr', 0.01),
         inner_steps=kwargs.get('inner_steps', 5),
         meta_lr=kwargs.get('meta_lr', 0.001),
         **{k: v for k, v in kwargs.items()
            if k not in ['min_samples', 'negative_ratio', 'tissue_source',
-                        'exclude_unknown_tissue', 'use_maml',
+                        'exclude_unknown_tissue', 'tissue_graph_weight', 'use_maml',
                         'inner_lr', 'inner_steps', 'meta_lr']}
     )
 
