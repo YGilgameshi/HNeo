@@ -9,6 +9,7 @@
 
 import json
 import pickle
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional
 import pandas as pd
@@ -27,6 +28,41 @@ class NegativeSampleCache:
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._fingerprint_cache = {}
+
+    @staticmethod
+    def _update_hash_from_file(hasher, file_path: Path):
+        """流式读取文件，避免对大型split一次性占用内存。"""
+        hasher.update(file_path.name.encode())
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                hasher.update(chunk)
+
+    def _get_data_fingerprint(self, data_file: str) -> str:
+        """为文件或train/val/test目录生成稳定的内容指纹。"""
+        path = Path(data_file)
+        cache_id = str(path.resolve())
+        if cache_id in self._fingerprint_cache:
+            return self._fingerprint_cache[cache_id]
+
+        hasher = hashlib.sha256()
+        if path.is_dir():
+            split_files = [path / name for name in ('train.tsv', 'val.tsv', 'test.tsv')]
+            split_files = [p for p in split_files if p.is_file()]
+            if not split_files:
+                raise FileNotFoundError(
+                    f"缓存数据目录中未找到train.tsv/val.tsv/test.tsv: {path}"
+                )
+            for split_file in split_files:
+                self._update_hash_from_file(hasher, split_file)
+        elif path.is_file():
+            self._update_hash_from_file(hasher, path)
+        else:
+            raise FileNotFoundError(f"缓存数据来源不存在: {path}")
+
+        fingerprint = hasher.hexdigest()[:16]
+        self._fingerprint_cache[cache_id] = fingerprint
+        return fingerprint
 
     def _get_cache_key(self, data_file: str, mode: str, config: dict) -> str:
         """
@@ -37,8 +73,6 @@ class NegativeSampleCache:
         - 训练模式
         - 关键配置参数
         """
-        import hashlib
-
         # 提取关键配置
         key_config = {
             'mode': mode,
@@ -48,12 +82,14 @@ class NegativeSampleCache:
         }
 
         # 组合为字符串
-        key_str = f"{Path(data_file).stem}_{json.dumps(key_config, sort_keys=True)}"
+        data_fingerprint = self._get_data_fingerprint(data_file)
+        key_str = f"{data_fingerprint}_{json.dumps(key_config, sort_keys=True)}"
 
         # 生成hash (避免太长)
         key_hash = hashlib.md5(key_str.encode()).hexdigest()[:8]
 
-        return f"{Path(data_file).stem}_{mode}_{key_hash}"
+        source_name = Path(data_file).name or Path(data_file).stem
+        return f"{source_name}_{mode}_{key_hash}"
 
     def _get_cache_paths(self, cache_key: str) -> dict:
         """获取缓存文件路径"""
@@ -125,6 +161,7 @@ class NegativeSampleCache:
         # 保存元数据
         metadata = {
             'data_file': str(data_file),
+            'data_fingerprint': self._get_data_fingerprint(data_file),
             'mode': mode,
             'config': config,
             'created_at': datetime.now().isoformat(),
